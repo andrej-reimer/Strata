@@ -8319,9 +8319,13 @@ int main(int argc, char** argv) {
                 // though every parked conversation could give its RAM back - and refusing here throws
                 // away the whole prompt read that produced this snapshot (measured: 270k tokens, 96 s).
                 // Evict the least recently active parked conversations until it fits, or until none are
-                // left.  Each ConversationBuffer is a list of 16 MiB segments, each segment its own
-                // allocation, so an evicted entry is back with the kernel before the next check reads
-                // /proc/meminfo; no waiting is needed.  slots() bounds the loop, and the two lines
+                // left.  Each ConversationBuffer is a list of 16 MiB segments held in anonymous mappings
+                // (MappedAllocator, conversation_buffer.hpp); freed full segments wait in a small spare pool
+                // for the next capture, so the spare pool goes back to the kernel first and again after every
+                // eviction, before the next check reads /proc/meminfo; no waiting is needed.  (With glibc's
+                // malloc the freed segments stayed in the brk heap, and this loop evicted everything and still
+                // refused.)  The checkpoints' running-state vectors stay malloc-managed.  slots() bounds the
+                // loop, and the two lines
                 // below say what it did either way.  The reading is the guard's (MemAvailable, the cgroup
                 // limits above the engine, --memory-limit-mib); `mem` keeps the last one for the refusal line.
                 size_t evicted = 0;
@@ -8331,19 +8335,25 @@ int main(int argc, char** argv) {
                     return strata::core::conversation_memory_admit(
                         mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
                 };
-                while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
-                       conversations.evict_oldest())
+                size_t returned = 0;
+                bool fits = admit();
+                if (!fits && (returned = strata::core::release_conversation_segments()) != 0) fits = admit();
+                while (!fits && conversations.size() > 0 && evicted < conversations.slots() &&
+                       conversations.evict_oldest()) {
                     ++evicted;
-                if (!admit()) {
+                    returned += strata::core::release_conversation_segments();
+                    fits = admit();
+                }
+                if (!fits) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
                                  evicted, conversations.size());
                     return true;
                 }
-                if (evicted)
-                    std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
+                if (evicted || returned)
+                    std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor, %zu MiB of spare segments returned)\n",
                                  evicted, evicted == 1 ? "" : "s", additional >> 20,
-                                 (long long) o.conversation_cache_min_free_mib);
+                                 (long long) o.conversation_cache_min_free_mib, returned >> 20);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
