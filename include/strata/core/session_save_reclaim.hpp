@@ -24,9 +24,15 @@ SessionSaveReclaimed session_save_reclaim(std::vector<ConversationCheckpoint>& c
     auto room = available();
     auto done = [&] { return !room || need == UINT64_MAX || conversation_memory_admit(room, need, floor); };
     if (done()) return out;
+    if (const size_t spare = release_conversation_segments()) {   // freed segments the cache kept mapped
+        out.bytes += spare;
+        room = available();
+        if (done()) return out;
+    }
     if (cache.retained_bytes()) {
         out.bytes += cache.retained_bytes();
         { auto unused = cache.take_reuse(); }
+        out.bytes += release_conversation_segments();
         room = available();
         if (done()) return out;
     }
@@ -35,6 +41,7 @@ SessionSaveReclaimed session_save_reclaim(std::vector<ConversationCheckpoint>& c
         if (!cache.evict_oldest()) break; // pinned conversations stay parked
         ++out.parked;
         out.bytes += before - cache.bytes();
+        release_conversation_segments();
         room = available();
         if (done()) return out;
     }

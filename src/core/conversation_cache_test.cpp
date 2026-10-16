@@ -1,4 +1,10 @@
 #include "strata/core/conversation_cache.hpp"
+#include <cstring>
+#include <utility>
+#ifdef __linux__
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +52,67 @@ int main() {
         check(bytes == copy, "equality ignores differing segmentation after rewind and regrowth");
         check(!bytes.read(tail.data(), bytes.size()-1, 2), "range check rejects a truncated payload");
         check(bytes.allocation_peak(SIZE_MAX) == SIZE_MAX, "allocation estimate rejects overflow");
+    }
+    {   // each segment is its own mapping (Linux), so an evicted segment is back with the kernel at once
+        ConversationBuffer bytes;
+        const size_t size = 3 * ConversationBuffer::segment_bytes + 17;
+        bytes.resize(size, 0x5a);
+        std::vector<const uint8_t*> starts;
+        size_t seen = 0;
+        bytes.visit(0, size, [&](const uint8_t* p, size_t n, size_t) { starts.push_back(p); seen += n; return true; });
+        check(seen == size && starts.size() == 4, "mapped segments: a fresh capture holds three full segments and a tail");
+        ConversationBuffer copy(bytes);
+        check(copy == bytes && copy.bytes() == bytes.bytes(), "mapped segments: a copy is byte-identical and accounts the same");
+        ConversationBuffer moved(std::move(copy));
+        check(moved == bytes && copy.empty() && copy.bytes() == 0, "mapped segments: a move keeps the bytes and empties the source");
+#ifdef __linux__
+        for (const uint8_t* p : starts)
+            check(reinterpret_cast<uintptr_t>(p) % 4096 == 0, "mapped segments: every segment, the tail too, starts on a page");
+        static char maps[1 << 16];   // static: reading /proc/self/maps must not allocate, a freed address could be reused
+        auto mapping = [&](const uint8_t* p) {   // 0 = not mapped, 1 = mapped, 2 = inside the malloc heap
+            const int fd = ::open("/proc/self/maps", O_RDONLY);
+            if (fd < 0) return -1;
+            size_t len = 0;
+            for (ssize_t got; (got = ::read(fd, maps + len, sizeof maps - 1 - len)) > 0; ) len += (size_t) got;
+            ::close(fd);
+            maps[len] = 0;
+            const unsigned long a = (unsigned long) reinterpret_cast<uintptr_t>(p);
+            for (char* line = maps; line != nullptr && *line != 0; ) {
+                char* end = std::strchr(line, '\n');
+                if (end != nullptr) *end = 0;
+                unsigned long lo = 0, hi = 0;
+                if (std::sscanf(line, "%lx-%lx", &lo, &hi) == 2 && a >= lo && a < hi)
+                    return std::strstr(line, "[heap]") != nullptr ? 2 : 1;
+                line = end != nullptr ? end + 1 : nullptr;
+            }
+            return 0;
+        };
+        for (const uint8_t* p : starts) check(mapping(p) == 1, "mapped segments: a live segment is mapped and not in the malloc heap");
+        release_conversation_segments();   // start from an empty spare pool
+        bytes.resize(0);
+        check(mapping(starts[3]) == 0, "mapped segments: resize(0) unmaps the tail at once");
+        for (size_t i = 0; i < 3; ++i) check(mapping(starts[i]) == 1, "mapped segments: a freed full segment waits mapped in the spare pool");
+        const uint8_t* start = nullptr;
+        {
+            ConversationBuffer other;
+            other.resize(ConversationBuffer::segment_bytes, 1);
+            other.visit(0, 1, [&](const uint8_t* p, size_t, size_t) { start = p; return true; });
+            check(start == starts[0] || start == starts[1] || start == starts[2], "mapped segments: a new full segment reuses a spare one");
+            uint8_t first = 0;
+            check(other.read(&first, 0, 1) && first == 1, "mapped segments: a reused segment holds the new contents");
+        }
+        check(mapping(start) == 1, "mapped segments: destroying the buffer returns its segment to the spare pool");
+        check(release_conversation_segments() == 3 * ConversationBuffer::segment_bytes, "mapped segments: release returns every spare segment");
+        for (size_t i = 0; i < 3; ++i) check(mapping(starts[i]) == 0, "mapped segments: release unmaps the spare segments");
+        check(release_conversation_segments() == 0, "mapped segments: a second release has nothing left");
+        {
+            ConversationBuffer other;
+            other.resize(ConversationBuffer::segment_bytes + 1, 2);
+            other.visit(0, 1, [&](const uint8_t* p, size_t, size_t) { start = p; return true; });
+        }
+        release_conversation_segments();
+        check(mapping(start) == 0, "mapped segments: destroying a buffer, then releasing, unmaps its segment");
+#endif
     }
     {
         ConversationBuffer bytes;

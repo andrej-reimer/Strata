@@ -7510,8 +7510,10 @@ int main(int argc, char **argv) try {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t retained = reuse.bytes() + stage_retained;
                 const size_t additional = estimate > retained ? estimate - retained : 0;
-                if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(),
-                        additional, floor)) {
+                // freed full segments wait mapped in a spare pool (conversation_buffer.hpp); give them back first
+                if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(), additional, floor) &&
+                    (!strata::core::release_conversation_segments() ||
+                     !strata::core::conversation_memory_admit(strata::core::available_host_bytes(), additional, floor))) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib);
                     return true;
